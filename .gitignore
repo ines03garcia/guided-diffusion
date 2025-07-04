@@ -3,3 +3,6 @@ __pycache__/
 classify_image_graph_def.pb
 *.py[cod]
 *.ipynb_checkpoints
+guided_diffusion.egg-info/
+build/
+dist/

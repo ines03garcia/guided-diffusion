@@ -26,6 +26,7 @@ class TrainLoop:
         model,
         diffusion,
         data,
+        image_size,
         batch_size,
         microbatch,
         lr,
@@ -42,6 +43,7 @@ class TrainLoop:
         self.model = model
         self.diffusion = diffusion
         self.data = data
+        self.image_size = image_size
         self.batch_size = batch_size
         self.microbatch = microbatch if microbatch > 0 else batch_size
         self.lr = lr
@@ -155,12 +157,51 @@ class TrainLoop:
             not self.lr_anneal_steps
             or self.step + self.resume_step < self.lr_anneal_steps
         ):
-            batch, cond = next(self.data)
+            batch, cond = next(self.data) # Gets a batch from the Data Loader
+
+            print(f"\n-----\nRUNNING STEP {self.step + self.resume_step}\n-----\n")
             self.run_step(batch, cond)
+            print(f"\n-----\nFINISHED\n-----\n")
             if self.step % self.log_interval == 0:
                 logger.dumpkvs()
             if self.step % self.save_interval == 0:
+                print(f"\n-----\nLOG: SAMPLING {self.batch_size} IMAGES\n-----\n")
                 self.save()
+
+                # Sampling a batch of images to see the model's evolution
+                all_images = []
+                all_images_img = []
+                all_labels = []
+
+                model_kwargs = {}
+
+                # Sampling function
+                sample_fn = (
+                    self.diffusion.p_sample_loop
+                )
+                # Sampling microbatch_size (4) images
+                sample = sample_fn(
+                    self.ddp_model,
+                    (self.batch_size, batch.shape[1], self.image_size, self.image_size),
+                    clip_denoised=self.clip_denoised,
+                    model_kwargs=model_kwargs,
+                )
+                sample_img = sample.to(torch.float) # Convert to float type sensor
+
+                all_images_img.extend([sample_img])
+
+                arr_img = torch.cat(all_images_img, axis=0)
+                # From self.save_interval to self.save_interval steps, samples images via p_sample_loop and saves them
+                print("Saving output image...") 
+                out_path_img = os.path.join(logger.get_dir(), f"images/samples_{self.step + self.resume_step}.png")
+                print(sample_img.shape, arr_img.shape)
+                if self.class_cond:
+                    label_arr = np.concatenate(all_labels, axis=0)
+                    utils.save_image((arr_img[:,0,:,:]).unsqueeze(1), out_path_img, nrow=4)
+                else:
+                    utils.save_image((arr_img[:,0,:,:]).unsqueeze(1), out_path_img, nrow=4)
+
+
                 # Run for a finite amount of time in integration tests.
                 if os.environ.get("DIFFUSION_TRAINING_TEST", "") and self.step > 0:
                     return
@@ -171,7 +212,7 @@ class TrainLoop:
 
     def run_step(self, batch, cond):
         self.forward_backward(batch, cond)
-        took_step = self.mp_trainer.optimize(self.opt)
+        took_step = self.mp_trainer.optimize(self.opt) # Uses AdamW optimizer to update weights
         if took_step:
             self._update_ema()
         self._anneal_lr()
