@@ -45,19 +45,19 @@ def model_and_diffusion_defaults():
     Defaults for image training.
     """
     res = dict(
-        image_size=64,
+        image_size=256,
         num_channels=128,
         num_res_blocks=2,
-        num_heads=4,
+        num_heads=1,
         num_heads_upsample=-1,
         num_head_channels=-1,
-        attention_resolutions="16,8",
+        attention_resolutions="32,16,8",
         channel_mult="",
         dropout=0.0,
         class_cond=False,
         use_checkpoint=False,
         use_scale_shift_norm=True,
-        resblock_updown=False,
+        resblock_updown=True,
         use_fp16=False,
         use_new_attention_order=False,
     )
@@ -165,9 +165,9 @@ def create_model(
 
     return UNetModel(
         image_size=image_size,
-        in_channels=3,
+        in_channels=1,
         model_channels=num_channels,
-        out_channels=(3 if not learn_sigma else 6),
+        out_channels=(1 if not learn_sigma else 2),
         num_res_blocks=num_res_blocks,
         attention_resolutions=tuple(attention_ds),
         dropout=dropout,

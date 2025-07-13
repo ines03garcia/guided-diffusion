@@ -19,8 +19,10 @@ from guided_diffusion.train_util import TrainLoop
 from guided_diffusion.config import PROJECT_ROOT, ROOT
 
 
+
 def main():
     args = create_argparser().parse_args()
+    
     print(vars(args))
 
     dist_util.setup_dist()
@@ -36,11 +38,14 @@ def main():
     )
     
 
-    device = dist_util.dev()
-    print("Using device:", device)
-    model = model.to(device)
     if args.gpus > 1:
         model = nn.DataParallel(model)
+        print("Using cuda!")
+        model = model.to("cuda")
+    else:
+        device = dist_util.dev()
+        print("Using device:", device)
+        model = model.to(device)
 
 
     schedule_sampler = create_named_schedule_sampler(args.schedule_sampler, diffusion)
@@ -83,12 +88,12 @@ def create_argparser():
         schedule_sampler="uniform",
         lr=1e-4,
         weight_decay=0.05,
-        lr_anneal_steps=0,
+        lr_anneal_steps=500000,
         batch_size=16,
         microbatch=4,  # -1 disables microbatches
         ema_rate="0.9999",  # comma-separated list of EMA values
-        log_interval=10000,
-        save_interval=10000,
+        log_interval=1000,
+        save_interval=1000,
         resume_checkpoint="",
         use_fp16=False,
         fp16_scale_growth=1e-3,

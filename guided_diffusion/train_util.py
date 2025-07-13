@@ -4,6 +4,7 @@ import os
 
 import blobfile as bf
 import torch as th
+from torchvision import utils
 import torch.distributed as dist
 from torch.nn.parallel.distributed import DistributedDataParallel as DDP
 from torch.optim import AdamW
@@ -13,9 +14,7 @@ from .fp16_util import MixedPrecisionTrainer
 from .nn import update_ema
 from .resample import LossAwareSampler, UniformSampler
 
-# For ImageNet experiments, this was a good default value.
-# We found that the lg_loss_scale quickly climbed to
-# 20-21 within the first ~1K steps of training.
+
 INITIAL_LOG_LOSS_SCALE = 20.0
 
 
@@ -38,7 +37,8 @@ class TrainLoop:
         fp16_scale_growth=1e-3,
         schedule_sampler=None,
         weight_decay=0.0,
-        lr_anneal_steps=0,
+        lr_anneal_steps=500000, # 0 Review this value
+        clip_denoised=True
     ):
         self.model = model
         self.diffusion = diffusion
@@ -60,6 +60,7 @@ class TrainLoop:
         self.schedule_sampler = schedule_sampler or UniformSampler(diffusion)
         self.weight_decay = weight_decay
         self.lr_anneal_steps = lr_anneal_steps
+        self.clip_denoised = clip_denoised
 
         self.step = 0
         self.resume_step = 0
@@ -78,6 +79,7 @@ class TrainLoop:
             self.mp_trainer.master_params, lr=self.lr, weight_decay=self.weight_decay
         )
         if self.resume_step:
+            print("Resuming step...")
             self._load_optimizer_state()
             # Model was resumed, either due to a restart or a checkpoint
             # being specified at the command line.
@@ -91,6 +93,7 @@ class TrainLoop:
             ]
 
         if th.cuda.is_available():
+            print("CUDA is available - using DDP")
             self.use_ddp = True
             self.ddp_model = DDP(
                 self.model,
@@ -108,6 +111,7 @@ class TrainLoop:
                 )
             self.use_ddp = False
             self.ddp_model = self.model
+        os.makedirs(os.path.join(logger.get_dir(), 'images'), exist_ok=True)
 
     def _load_and_sync_parameters(self):
         resume_checkpoint = find_resume_checkpoint() or self.resume_checkpoint
@@ -158,7 +162,9 @@ class TrainLoop:
             or self.step + self.resume_step < self.lr_anneal_steps
         ):
             batch, cond = next(self.data) # Gets a batch from the Data Loader
-
+            # cond will have the BIRADS category, but since we don't want to condition the model, we are going to set it to None
+            cond = None
+            
             print(f"\n-----\nRUNNING STEP {self.step + self.resume_step}\n-----\n")
             self.run_step(batch, cond)
             print(f"\n-----\nFINISHED\n-----\n")
@@ -186,20 +192,16 @@ class TrainLoop:
                     clip_denoised=self.clip_denoised,
                     model_kwargs=model_kwargs,
                 )
-                sample_img = sample.to(torch.float) # Convert to float type sensor
+                sample_img = sample.to(th.float) # Convert to float type sensor
 
                 all_images_img.extend([sample_img])
 
-                arr_img = torch.cat(all_images_img, axis=0)
+                arr_img = th.cat(all_images_img, axis=0)
                 # From self.save_interval to self.save_interval steps, samples images via p_sample_loop and saves them
                 print("Saving output image...") 
                 out_path_img = os.path.join(logger.get_dir(), f"images/samples_{self.step + self.resume_step}.png")
                 print(sample_img.shape, arr_img.shape)
-                if self.class_cond:
-                    label_arr = np.concatenate(all_labels, axis=0)
-                    utils.save_image((arr_img[:,0,:,:]).unsqueeze(1), out_path_img, nrow=4)
-                else:
-                    utils.save_image((arr_img[:,0,:,:]).unsqueeze(1), out_path_img, nrow=4)
+                utils.save_image((arr_img[:,0,:,:]).unsqueeze(1), out_path_img, nrow=4)
 
 
                 # Run for a finite amount of time in integration tests.
@@ -211,36 +213,37 @@ class TrainLoop:
             self.save()
 
     def run_step(self, batch, cond):
-        self.forward_backward(batch, cond)
-        took_step = self.mp_trainer.optimize(self.opt) # Uses AdamW optimizer to update weights
+        self.forward_backward(batch, cond) # Forward pass to calculate the losses, backward pass to calculate the gradients
+        took_step = self.mp_trainer.optimize(self.opt) # Uses AdamW optimizer to update weights (using the gradients calculated on the previous instruction)
         if took_step:
             self._update_ema()
         self._anneal_lr()
         self.log_step()
 
     def forward_backward(self, batch, cond):
-        self.mp_trainer.zero_grad()
-        for i in range(0, batch.shape[0], self.microbatch):
-            micro = batch[i : i + self.microbatch].to(dist_util.dev())
-            micro_cond = {
-                k: v[i : i + self.microbatch].to(dist_util.dev())
-                for k, v in cond.items()
-            }
-            last_batch = (i + self.microbatch) >= batch.shape[0]
-            t, weights = self.schedule_sampler.sample(micro.shape[0], dist_util.dev())
+        # Run forward and reverse process of ddpm
+        self.mp_trainer.zero_grad() # Clean accumulated gradients
+        for i in range(0, batch.shape[0], self.microbatch): # from 0 to batch_size (16), batchsize/4 (4) at a time
+            micro = batch[i : i + self.microbatch].to(dist_util.dev())  # Move microbatch to GPU
 
-            compute_losses = functools.partial(
+            last_batch = (i + self.microbatch) >= batch.shape[0] # 1 if last microbatch, 0 otherwise
+            t, weights = self.schedule_sampler.sample(micro.shape[0], dist_util.dev()) # Initialize t and weights
+
+            compute_losses = functools.partial( # Create compute_losses function
                 self.diffusion.training_losses,
                 self.ddp_model,
                 micro,
-                t,
-                model_kwargs=micro_cond,
+                t
             )
 
-            if last_batch or not self.use_ddp:
+            """
+            Gradient synchronization — In DDP, gradients computed from microbatches are accumulated locally. 
+            Before the optimizer step, these gradients are synchronized (averaged or summed) across all replicas to ensure consistent model updates on all GPUs.
+            """
+            if last_batch or not self.use_ddp: # Perform normal forward pass (q_sample) and calculate loss (In case of DDP, synchronize accumulated loss)
                 losses = compute_losses()
             else:
-                with self.ddp_model.no_sync():
+                with self.ddp_model.no_sync(): # Perform forward pass but no synchronizing across multiple devices yet
                     losses = compute_losses()
 
             if isinstance(self.schedule_sampler, LossAwareSampler):
@@ -252,7 +255,9 @@ class TrainLoop:
             log_loss_dict(
                 self.diffusion, t, {k: v * weights for k, v in losses.items()}
             )
-            self.mp_trainer.backward(loss)
+            self.mp_trainer.backward(loss) # Runs backpropagation to compute gradients of the loss with respect to model parameters
+
+    
 
     def _update_ema(self):
         for rate, params in zip(self.ema_rate, self.ema_params):
